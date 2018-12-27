@@ -15,74 +15,20 @@
 #include <assert.h>
 #include <vector>
 #include <chrono>
+#include <map>
 
 #include <vulkan/vulkan.h>
 #include "VulkanExampleBase.h"
 #include "VulkanTexture.hpp"
 #include "VulkanglTFModel.hpp"
+#include "VulkanUtils.hpp"
+#include "ui.hpp"
 
 #define GLM_FORCE_RADIANS
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
-#define TINYGLTF_IMPLEMENTATION
-#define STB_IMAGE_IMPLEMENTATION
-#include "tiny_gltf.h"
-
-/*
-	Utility functions
-*/
-VkPipelineShaderStageCreateInfo loadShader(VkDevice device, std::string filename, VkShaderStageFlagBits stage)
-{
-	VkPipelineShaderStageCreateInfo shaderStage{};
-	shaderStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-	shaderStage.stage = stage;
-	shaderStage.pName = "main";
-#if defined(VK_USE_PLATFORM_ANDROID_KHR)
-	std::string assetpath = "shaders/" + filename;
-	AAsset* asset = AAssetManager_open(androidApp->activity->assetManager, assetpath.c_str(), AASSET_MODE_STREAMING);
-	assert(asset);
-	size_t size = AAsset_getLength(asset);
-	assert(size > 0);
-	char *shaderCode = new char[size];
-	AAsset_read(asset, shaderCode, size);
-	AAsset_close(asset);
-	VkShaderModule shaderModule;
-	VkShaderModuleCreateInfo moduleCreateInfo;
-	moduleCreateInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-	moduleCreateInfo.pNext = NULL;
-	moduleCreateInfo.codeSize = size;
-	moduleCreateInfo.pCode = (uint32_t*)shaderCode;
-	moduleCreateInfo.flags = 0;
-	VK_CHECK_RESULT(vkCreateShaderModule(device, &moduleCreateInfo, NULL, &shaderStage.module));
-	delete[] shaderCode;
-#else
-	std::ifstream is("./../data/shaders/" + filename, std::ios::binary | std::ios::in | std::ios::ate);
-
-	if (is.is_open()) {
-		size_t size = is.tellg();
-		is.seekg(0, std::ios::beg);
-		char* shaderCode = new char[size];
-		is.read(shaderCode, size);
-		is.close();
-		assert(size > 0);
-		VkShaderModuleCreateInfo moduleCreateInfo{};
-		moduleCreateInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-		moduleCreateInfo.codeSize = size;
-		moduleCreateInfo.pCode = (uint32_t*)shaderCode;
-		vkCreateShaderModule(device, &moduleCreateInfo, NULL, &shaderStage.module);
-		delete[] shaderCode;
-	}
-	else {
-		std::cerr << "Error: Could not open shader file \"" << filename << "\"" << std::endl;
-		shaderStage.module = VK_NULL_HANDLE;
-	}
-
-#endif
-	assert(shaderStage.module != VK_NULL_HANDLE);
-	return shaderStage;
-}
 
 /*
 	PBR example main class
@@ -103,14 +49,7 @@ public:
 		vkglTF::Model skybox;
 	} models;
 
-	struct Buffer {
-		VkBuffer buffer;
-		VkDeviceMemory memory;
-		VkDescriptorBufferInfo descriptor;
-		void *mapped;
-	};
-
-	struct UniformBuffers {
+	struct UniformBufferSet {
 		Buffer scene;
 		Buffer skybox;
 		Buffer params;
@@ -124,12 +63,15 @@ public:
 		float flipUV = 0.0f;
 	} shaderValuesScene, shaderValuesSkybox;
 
-	struct UBOParams {
+	struct shaderValuesParams {
 		glm::vec4 lightDir;
 		float exposure = 4.5f;
 		float gamma = 2.2f;
 		float prefilteredCubeMipLevels;
-	} uboParams;
+		float scaleIBLAmbient = 1.0f;
+		glm::vec4 scaleFGDSpec = glm::vec4(0.0f);
+		glm::vec4 scaleDiffBaseMR = glm::vec4(0.0f);
+	} shaderValuesParams;
 
 	VkPipelineLayout pipelineLayout;
 
@@ -152,7 +94,7 @@ public:
 	std::vector<DescriptorSets> descriptorSets;
 
 	std::vector<VkCommandBuffer> commandBuffers;
-	std::vector<UniformBuffers> uniformBuffers;
+	std::vector<UniformBufferSet> uniformBuffers;
 
 	std::vector<VkFence> waitFences;
 	std::vector<VkSemaphore> renderCompleteSemaphores;
@@ -165,11 +107,20 @@ public:
 	float animationTimer = 0.0f;
 
 	float scale = 1.0f;
+	bool displayBackground = true;
 	
 	struct LightSource {
 		glm::vec3 color = glm::vec3(1.0f);
 		glm::vec3 rotation = glm::vec3(75.0f, 40.0f, 0.0f);
 	} lightSource;
+
+	UI *ui;
+
+#if defined(VK_USE_PLATFORM_ANDROID_KHR)
+	const std::string assetpath = "";
+#else
+	const std::string assetpath = "./../data/";
+#endif
 
 	bool rotateModel = false;
 	glm::vec3 modelrot = glm::vec3(0.0f);
@@ -194,17 +145,12 @@ public:
 		float alphaMaskCutoff;
 	} pushConstBlockMaterial;
 
+	std::map<std::string, std::string> environments;
+	std::string selectedEnvironment = "papermill";
+
 	VulkanExample() : VulkanExampleBase()
 	{
 		title = "Vulkan glTF 2.0 PBR";
-		camera.type = Camera::CameraType::lookat;
-
-		camera.setPerspective(45.0f, (float)width / (float)height, 0.1f, 256.0f);
-		camera.rotationSpeed = 0.25f;
-		camera.movementSpeed = 0.1f;
-
-		camera.setPosition({ 0.0f, 0.0f, 2.5f });
-		camera.setRotation({ 0.0f, 0.0f, 0.0f });
 	}
 
 	~VulkanExample()
@@ -222,12 +168,9 @@ public:
 		models.skybox.destroy(device);
 
 		for (auto buffer : uniformBuffers) {
-			vkDestroyBuffer(device, buffer.scene.buffer, nullptr);
-			vkFreeMemory(device, buffer.scene.memory, nullptr);
-			vkDestroyBuffer(device, buffer.skybox.buffer, nullptr);
-			vkFreeMemory(device, buffer.skybox.memory, nullptr);
-			vkDestroyBuffer(device, buffer.params.buffer, nullptr);
-			vkFreeMemory(device, buffer.params.memory, nullptr);
+			buffer.params.destroy();
+			buffer.scene.destroy();
+			buffer.skybox.destroy();
 		}
 		for (auto fence : waitFences) {
 			vkDestroyFence(device, fence, nullptr);
@@ -244,6 +187,8 @@ public:
 		textures.prefilteredCube.destroy();
 		textures.lutBrdf.destroy();
 		textures.empty.destroy();
+
+		delete ui;
 	}
 
 	void renderNode(vkglTF::Node *node, uint32_t cbIndex, vkglTF::Material::AlphaMode alphaMode) {
@@ -348,9 +293,11 @@ public:
 
 			VkDeviceSize offsets[1] = { 0 };
 
-			vkCmdBindDescriptorSets(currentCB, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSets[i].skybox, 0, nullptr);
-			vkCmdBindPipeline(currentCB, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines.skybox);
-			models.skybox.draw(currentCB);
+			if (displayBackground) {
+				vkCmdBindDescriptorSets(currentCB, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSets[i].skybox, 0, nullptr);
+				vkCmdBindPipeline(currentCB, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines.skybox);
+				models.skybox.draw(currentCB);
+			}
 
 			vkCmdBindPipeline(currentCB, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines.pbr);
 
@@ -373,31 +320,44 @@ public:
 				renderNode(node, i, vkglTF::Material::ALPHAMODE_BLEND);
 			}
 
+			// User interface
+			ui->draw(currentCB);
+
 			vkCmdEndRenderPass(currentCB);
 			VK_CHECK_RESULT(vkEndCommandBuffer(currentCB));
 		}
 	}
 
+	void loadEnvironment(std::string filename)
+	{
+		std::cout << "Loading environment from " << filename << std::endl;
+		if (textures.environmentCube.image) {
+			textures.environmentCube.destroy();
+			textures.irradianceCube.destroy();
+			textures.prefilteredCube.destroy();
+		}
+		textures.environmentCube.loadFromFile(filename, VK_FORMAT_R16G16B16A16_SFLOAT, vulkanDevice, queue);
+		generateCubemaps();
+	}
+
 	void loadAssets()
 	{
 #if defined(VK_USE_PLATFORM_ANDROID_KHR)
-		const std::string assetpath = "";
 #else
 		const std::string assetpath = "./../data/";
 		struct stat info;
 		if (stat(assetpath.c_str(), &info) != 0) {
 			std::string msg = "Could not locate asset path in \"" + assetpath + "\".\nMake sure binary is run from correct relative directory!";
 			std::cerr << msg << std::endl;
-#if defined(_WIN32)
-			MessageBox(NULL, msg.c_str(), "Fatal error", MB_OK | MB_ICONERROR);
-#endif
 			exit(-1);
 		}
 #endif
+		readDirectory(assetpath + "environments", "*.ktx", environments, false);
+
 		textures.empty.loadFromFile(assetpath + "textures/empty.ktx", VK_FORMAT_R8G8B8A8_UNORM, vulkanDevice, queue);
 
 		std::string sceneFile = assetpath + "models/DamagedHelmet/glTF-Embedded/DamagedHelmet.gltf";
-		std::string envMapFile = assetpath + "textures/papermill_hdr16f_cube.ktx";
+		std::string envMapFile = assetpath + "environments/papermill.ktx";
 		shaderValuesScene.flipUV = 1.0f;
 		for (size_t i = 0; i < args.size(); i++) {
 			if (std::string(args[i]).find(".gltf") != std::string::npos) {
@@ -420,10 +380,10 @@ public:
 			}
 		}
 
-		textures.environmentCube.loadFromFile(envMapFile, VK_FORMAT_R16G16B16A16_SFLOAT, vulkanDevice, queue);
 		models.scene.loadFromFile(sceneFile, vulkanDevice, queue);
-
 		models.skybox.loadFromFile(assetpath + "models/Box/glTF-Embedded/Box.gltf", vulkanDevice, queue);
+
+		loadEnvironment(envMapFile.c_str());
 
 		// Scale and center model to fit into viewport
 		scale = 1.0f / models.scene.dimensions.radius;
@@ -1624,7 +1584,7 @@ public:
 					break;
 				case PREFILTEREDENV:
 					textures.prefilteredCube = cubemap;
-					uboParams.prefilteredCubeMipLevels = static_cast<float>(numMips);
+					shaderValuesParams.prefilteredCubeMipLevels = static_cast<float>(numMips);
 					break;
 			};
 
@@ -1640,41 +1600,10 @@ public:
 	void prepareUniformBuffers()
 	{
 		for (auto &uniformBuffer : uniformBuffers) {
-			// Object vertex shader uniform buffer
-			VK_CHECK_RESULT(vulkanDevice->createBuffer(
-				VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-				sizeof(shaderValuesScene),
-				&uniformBuffer.scene.buffer,
-				&uniformBuffer.scene.memory));
-
-			// Skybox vertex shader uniform buffer
-			VK_CHECK_RESULT(vulkanDevice->createBuffer(
-				VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-				sizeof(shaderValuesSkybox),
-				&uniformBuffer.skybox.buffer,
-				&uniformBuffer.skybox.memory));
-
-			// Shared parameter uniform buffer
-			VK_CHECK_RESULT(vulkanDevice->createBuffer(
-				VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-				sizeof(uboParams),
-				&uniformBuffer.params.buffer,
-				&uniformBuffer.params.memory));
-
-			// Descriptors
-			uniformBuffer.scene.descriptor = { uniformBuffer.scene.buffer, 0, sizeof(shaderValuesScene) };
-			uniformBuffer.skybox.descriptor = { uniformBuffer.skybox.buffer, 0, sizeof(shaderValuesSkybox) };
-			uniformBuffer.params.descriptor = { uniformBuffer.params.buffer, 0, sizeof(uboParams) };
-
-			// Map persistent
-			VK_CHECK_RESULT(vkMapMemory(device, uniformBuffer.scene.memory, 0, sizeof(shaderValuesScene), 0, &uniformBuffer.scene.mapped));
-			VK_CHECK_RESULT(vkMapMemory(device, uniformBuffer.skybox.memory, 0, sizeof(shaderValuesSkybox), 0, &uniformBuffer.skybox.mapped));
-			VK_CHECK_RESULT(vkMapMemory(device, uniformBuffer.params.memory, 0, sizeof(uboParams), 0, &uniformBuffer.params.mapped));
+			uniformBuffer.scene.create(vulkanDevice, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, sizeof(shaderValuesScene));
+			uniformBuffer.skybox.create(vulkanDevice, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, sizeof(shaderValuesSkybox));
+			uniformBuffer.params.create(vulkanDevice, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, sizeof(shaderValuesParams));
 		}
-
 		updateUniformBuffers();
 	}
 
@@ -1705,17 +1634,32 @@ public:
 
 	void updateParams()
 	{
-		uboParams.lightDir = glm::vec4(
+		shaderValuesParams.lightDir = glm::vec4(
 			sin(glm::radians(lightSource.rotation.x)) * cos(glm::radians(lightSource.rotation.y)),
 			sin(glm::radians(lightSource.rotation.y)),
 			cos(glm::radians(lightSource.rotation.x)) * cos(glm::radians(lightSource.rotation.y)),
 			0.0f);
 	}
 
+	void windowResized()
+	{
+		vkDeviceWaitIdle(device);
+		updateUniformBuffers();
+		updateOverlay();
+	}
+
 	void prepare()
 	{
 		VulkanExampleBase::prepare();
-		
+
+		camera.type = Camera::CameraType::lookat;
+
+		camera.setPerspective(45.0f, (float)width / (float)height, 0.1f, 256.0f);
+		camera.rotationSpeed = 0.25f;
+		camera.movementSpeed = 0.1f;
+		camera.setPosition({ 0.0f, 0.0f, 2.5f });
+		camera.setRotation({ 0.0f, 0.0f, 0.0f });
+
 		waitFences.resize(renderAhead);
 		presentCompleteSemaphores.resize(renderAhead);
 		renderCompleteSemaphores.resize(renderAhead);
@@ -1752,9 +1696,205 @@ public:
 		prepareUniformBuffers();
 		setupDescriptors();
 		preparePipelines();
+
+		ui = new UI(vulkanDevice, renderPass, queue, pipelineCache, settings.sampleCount);
+		updateOverlay();
+
 		buildCommandBuffers();
 
 		prepared = true;
+	}
+
+	/*
+		Update ImGui user interface
+	*/
+	void updateOverlay()
+	{
+		ImGuiIO& io = ImGui::GetIO();
+
+		io.DisplaySize = ImVec2((float)width, (float)height);
+		io.DeltaTime = frameTimer;
+
+		io.MousePos = ImVec2(mousePos.x, mousePos.y);
+		io.MouseDown[0] = mouseButtons.left;
+		io.MouseDown[1] = mouseButtons.right;
+
+		float scale = 1.0f;
+
+#if defined(__ANDROID__)
+		scale = (float)vks::android::screenDensity / (float)ACONFIGURATION_DENSITY_MEDIUM;
+#endif
+		ui->pushConstBlock.scale = glm::vec2(2.0f / io.DisplaySize.x, 2.0f / io.DisplaySize.y);
+		ui->pushConstBlock.translate = glm::vec2(-1.0f);
+
+		const float sideBarWidth = 160.0f * scale;
+		const float collapseBarWidth = 15.0f * scale;
+		const ImVec2 collapseButtonSize = ImVec2(collapseBarWidth, 50.0f * scale);
+		bool updateShaderParams = false;
+		bool updateCBs = false;
+
+		ImGui::NewFrame();
+
+		const float left = width - (ui->collapsed ? collapseBarWidth : sideBarWidth);
+		ImGui::SetNextWindowPos(ImVec2(left, 0));
+		ImGui::SetNextWindowSize(ImVec2(ui->collapsed ? collapseBarWidth : sideBarWidth, height), ImGuiSetCond_Always);
+		ImGui::Begin("Vulkan glTF 2.0 PBR", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysUseWindowPadding);
+
+		ImGui::Columns(2, "settings", false);
+		ImGui::SetColumnWidth(0, collapseBarWidth);
+		ImGui::SetColumnOffset(0, 0);
+		ImGui::SetCursorPosY((float)height / 2.0f - collapseButtonSize.y / 2.0f);
+		if (ImGui::Button(ui->collapsed ? "<" : ">", ImVec2(collapseButtonSize))) {
+			ui->collapsed = !ui->collapsed;
+		}
+		ImGui::SetCursorPosY(0.0f);
+		ImGui::NextColumn();
+
+		if (!ui->collapsed) {
+
+			bool metallicRoughnessWorkflow = true;
+			for (auto extension : models.scene.extensions) {
+				if (extension == "KHR_materials_pbrSpecularGlossiness") {
+					metallicRoughnessWorkflow = false;
+				}
+			}
+
+			ui->text("Vulkan glTF 2.0 PBR");
+			ImGui::Text("%.1d fps (%.2f ms)", lastFPS, (1000.0f / lastFPS));
+
+			if (ui->header("Environment")) {
+				if (ui->checkbox("Background", &displayBackground)) {
+					updateShaderParams = true;
+				}
+				ui->text("Exposure");
+				if (ui->slider("##exposure", &shaderValuesParams.exposure, 0.1f, 10.0f)) {
+					updateShaderParams = true;
+				}
+				ui->text("Gamma");
+				if (ui->slider("##gamma", &shaderValuesParams.gamma, 0.1f, 4.0f)) {
+					updateShaderParams = true;
+				}
+				ui->text("IBL contribution");
+				if (ui->slider("##ibl", &shaderValuesParams.scaleIBLAmbient, 0.0f, 1.0f)) {
+					updateShaderParams = true;
+				}
+			}
+
+			if (ui->header("Inputs")) {
+				if (ui->checkbox(metallicRoughnessWorkflow ? "Base Color" : "Diffuse", &shaderValuesParams.scaleDiffBaseMR[1])) {
+					shaderValuesParams.scaleDiffBaseMR = glm::vec4(0.0f, shaderValuesParams.scaleDiffBaseMR[1], 0.0f, 0.0f);
+					shaderValuesParams.scaleFGDSpec = glm::vec4(0.0f);
+					updateShaderParams = true;
+				};
+				if (ui->checkbox(metallicRoughnessWorkflow ? "Metallic" : "Specular", &shaderValuesParams.scaleDiffBaseMR[2])) {
+					shaderValuesParams.scaleDiffBaseMR = glm::vec4(0.0f, 0.0f, shaderValuesParams.scaleDiffBaseMR[2], 0.0f);
+					shaderValuesParams.scaleFGDSpec = glm::vec4(0.0f);
+					updateShaderParams = true;
+				};
+				if (ui->checkbox(metallicRoughnessWorkflow ? "Roughness" : "Glossiness", &shaderValuesParams.scaleDiffBaseMR[3])) {
+					shaderValuesParams.scaleDiffBaseMR = glm::vec4(0.0f, 0.0f, 0.0f, shaderValuesParams.scaleDiffBaseMR[3]);
+					shaderValuesParams.scaleFGDSpec = glm::vec4(0.0f);
+					updateShaderParams = true;
+				};
+			}
+
+			if (ui->header("PBR equation")) {
+				if (ui->checkbox("Diff(l,n)", &shaderValuesParams.scaleDiffBaseMR[0])) {
+					shaderValuesParams.scaleDiffBaseMR = glm::vec4(shaderValuesParams.scaleDiffBaseMR[0], 0.0f, 0.0f, 0.0f);
+					shaderValuesParams.scaleFGDSpec = glm::vec4(0.0f);
+					updateShaderParams = true;
+				};
+				if (ui->checkbox("F(l,h)", &shaderValuesParams.scaleFGDSpec[0])) {
+					shaderValuesParams.scaleDiffBaseMR = glm::vec4(0.0f);
+					shaderValuesParams.scaleFGDSpec = glm::vec4(shaderValuesParams.scaleFGDSpec[0], 0.0f, 0.0f, 0.0f);
+					updateShaderParams = true;
+				};
+				if (ui->checkbox("G(l,v,h)", &shaderValuesParams.scaleFGDSpec[1])) {
+					shaderValuesParams.scaleDiffBaseMR = glm::vec4(0.0f);
+					shaderValuesParams.scaleFGDSpec = glm::vec4(0.0f, shaderValuesParams.scaleFGDSpec[1], 0.0f, 0.0f);
+					updateShaderParams = true;
+				};
+				if (ui->checkbox("D(h)", &shaderValuesParams.scaleFGDSpec[2])) {
+					shaderValuesParams.scaleDiffBaseMR = glm::vec4(0.0f);
+					shaderValuesParams.scaleFGDSpec = glm::vec4(0.0f, 0.0f, shaderValuesParams.scaleFGDSpec[2], 0.0f);
+					updateShaderParams = true;
+				};
+				if (ui->checkbox("Specular ", &shaderValuesParams.scaleFGDSpec[3])) {
+					shaderValuesParams.scaleDiffBaseMR = glm::vec4(0.0f);
+					shaderValuesParams.scaleFGDSpec = glm::vec4(0.0f, 0.0f, 0.0f, shaderValuesParams.scaleFGDSpec[3]);
+					updateShaderParams = true;
+				};
+			}
+
+			if (ui->header("Scene")) {
+				ui->text("Environment");
+				if (ui->combo("##environment", selectedEnvironment, environments)) {
+					vkDeviceWaitIdle(device);
+					loadEnvironment(environments[selectedEnvironment]);
+					setupDescriptors();
+					updateCBs = true;
+				}
+			}
+		}
+
+		ImGui::End();
+		ImGui::Render();
+
+		ImDrawData* imDrawData = ImGui::GetDrawData();
+
+		// Check if ui buffers need to be recreated
+		if (imDrawData) {
+			VkDeviceSize vertexBufferSize = imDrawData->TotalVtxCount * sizeof(ImDrawVert);
+			VkDeviceSize indexBufferSize = imDrawData->TotalIdxCount * sizeof(ImDrawIdx);
+
+			bool updateBuffers = (ui->vertexBuffer.buffer == VK_NULL_HANDLE) || (ui->vertexBuffer.count != imDrawData->TotalVtxCount) || (ui->indexBuffer.buffer == VK_NULL_HANDLE) || (ui->indexBuffer.count != imDrawData->TotalIdxCount);
+
+			if (updateBuffers) {
+				vkDeviceWaitIdle(device);
+				if (ui->vertexBuffer.buffer) {
+					ui->vertexBuffer.destroy();
+				}
+				ui->vertexBuffer.create(vulkanDevice, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, vertexBufferSize);
+				ui->vertexBuffer.count = imDrawData->TotalVtxCount;
+				if (ui->indexBuffer.buffer) {
+					ui->indexBuffer.destroy();
+				}
+				ui->indexBuffer.create(vulkanDevice, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, indexBufferSize);
+				ui->indexBuffer.count = imDrawData->TotalIdxCount;
+			}
+
+			// Upload data
+			ImDrawVert* vtxDst = (ImDrawVert*)ui->vertexBuffer.mapped;
+			ImDrawIdx* idxDst = (ImDrawIdx*)ui->indexBuffer.mapped;
+			for (int n = 0; n < imDrawData->CmdListsCount; n++) {
+				const ImDrawList* cmd_list = imDrawData->CmdLists[n];
+				memcpy(vtxDst, cmd_list->VtxBuffer.Data, cmd_list->VtxBuffer.Size * sizeof(ImDrawVert));
+				memcpy(idxDst, cmd_list->IdxBuffer.Data, cmd_list->IdxBuffer.Size * sizeof(ImDrawIdx));
+				vtxDst += cmd_list->VtxBuffer.Size;
+				idxDst += cmd_list->IdxBuffer.Size;
+			}
+
+			ui->vertexBuffer.flush();
+			ui->indexBuffer.flush();
+
+			updateCBs = updateCBs || updateBuffers;
+		}
+
+		if (updateCBs) {
+			vkDeviceWaitIdle(device);
+			buildCommandBuffers();
+			vkDeviceWaitIdle(device);
+		}
+
+		if (updateShaderParams) {
+			updateParams();
+		}
+
+#if defined(VK_USE_PLATFORM_ANDROID_KHR)
+		if (mouseButtons.left) {
+			mouseButtons.left = false;
+		}
+#endif
 	}
 
 	virtual void render()
@@ -1762,6 +1902,8 @@ public:
 		if (!prepared) {
 			return;
 		}
+
+		updateOverlay();
 
 		VK_CHECK_RESULT(vkWaitForFences(device, 1, &waitFences[frameIndex], VK_TRUE, UINT64_MAX));
 		VK_CHECK_RESULT(vkResetFences(device, 1, &waitFences[frameIndex]));
@@ -1776,9 +1918,9 @@ public:
 
 		// Update UBOs
 		updateUniformBuffers();
-		UniformBuffers currentUB = uniformBuffers[currentBuffer];
+		UniformBufferSet currentUB = uniformBuffers[currentBuffer];
 		memcpy(currentUB.scene.mapped, &shaderValuesScene, sizeof(shaderValuesScene));
-		memcpy(currentUB.params.mapped, &uboParams, sizeof(uboParams));
+		memcpy(currentUB.params.mapped, &shaderValuesParams, sizeof(shaderValuesParams));
 		memcpy(currentUB.skybox.mapped, &shaderValuesSkybox, sizeof(shaderValuesSkybox));
 
 		const VkPipelineStageFlags waitDstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -1830,42 +1972,6 @@ public:
 			updateUniformBuffers();
 		}
 	}
-
-#if !defined(VK_USE_PLATFORM_ANDROID_KHR)
-	virtual void keyPressed(uint32_t key)
-	{
-		switch (key) {
-			case KEY_F1:
-				if (uboParams.exposure > 0.1f) {
-					uboParams.exposure -= 0.1f;
-					updateParams();
-					std::cout << "Exposure: " << uboParams.exposure << std::endl;
-				}
-				break;
-			case KEY_F2:
-				if (uboParams.exposure < 10.0f) {
-					uboParams.exposure += 0.1f;
-					updateParams();
-					std::cout << "Exposure: " << uboParams.exposure << std::endl;
-				}
-				break;
-			case KEY_F3:
-				if (uboParams.gamma > 0.1f) {
-					uboParams.gamma -= 0.1f;
-					updateParams();
-					std::cout << "Gamma: " << uboParams.gamma << std::endl;
-				}
-				break;
-			case KEY_F4:
-				if (uboParams.gamma < 10.0f) {
-					uboParams.gamma += 0.1f;
-					updateParams();
-					std::cout << "Gamma: " << uboParams.gamma << std::endl;
-				}
-				break;
-		}
-	}
-#endif
 };
 
 VulkanExample *vulkanExample;
@@ -1893,10 +1999,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 }
 #elif defined(VK_USE_PLATFORM_ANDROID_KHR)
 // Android entry point
-// A note on app_dummy(): This is required as the compiler may otherwise remove the main entry point of the application
 void android_main(android_app* state)
 {
-	app_dummy();
 	vulkanExample = new VulkanExample();
 	state->userData = vulkanExample;
 	state->onAppCmd = VulkanExample::handleAppCommand;

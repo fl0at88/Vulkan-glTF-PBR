@@ -114,6 +114,11 @@ void VulkanExampleBase::prepare()
 	initSwapchain();
 	setupSwapChain();
 
+#if defined(VK_USE_PLATFORM_ANDROID_KHR)
+	width = swapChain.extent.width;
+	height = swapChain.extent.height;
+#endif
+
 	/*
 		Command pool
 	*/
@@ -309,7 +314,6 @@ void VulkanExampleBase::renderFrame()
 	if (viewUpdated)
 	{
 		viewUpdated = false;
-		viewChanged();
 	}
 
 	render();
@@ -404,17 +408,6 @@ void VulkanExampleBase::renderLoop()
 				frameCounter = 0;
 			}
 
-			bool updateView = false;
-
-			// Check touch state (for movement)
-			if (touchDown) {
-				touchTimer += frameTimer;
-			}
-			if (touchTimer >= 1.0) {
-				camera.keys.up = true;
-				viewChanged();
-			}
-
 			// Check gamepad state
 			const float deadZone = 0.0015f;
 			// todo : check if gamepad is present
@@ -422,28 +415,14 @@ void VulkanExampleBase::renderLoop()
 			if (camera.type != Camera::CameraType::firstperson)
 			{
 				// Rotate
-				if (std::abs(gamePadState.axisLeft.x) > deadZone)
-				{
+				if (std::abs(gamePadState.axisLeft.x) > deadZone) {
 					camera.rotate(glm::vec3(0.0f, gamePadState.axisLeft.x * 0.5f, 0.0f));
-					updateView = true;
 				}
-				if (std::abs(gamePadState.axisLeft.y) > deadZone)
-				{
+				if (std::abs(gamePadState.axisLeft.y) > deadZone) {
 					camera.rotate(glm::vec3(gamePadState.axisLeft.y * 0.5f, 0.0f, 0.0f));
-					updateView = true;
 				}
-				if (updateView)
-				{
-					viewChanged();
-				}
-			}
-			else
-			{
-				updateView = camera.updatePad(gamePadState.axisLeft, gamePadState.axisRight, frameTimer);
-				if (updateView)
-				{
-					viewChanged();
-				}
+			} else {
+				camera.updatePad(gamePadState.axisLeft, gamePadState.axisRight, frameTimer);
 			}
 		}
 	}
@@ -454,7 +433,6 @@ void VulkanExampleBase::renderLoop()
 		if (viewUpdated)
 		{
 			viewUpdated = false;
-			viewChanged();
 		}
 		render();
 		frameCounter++;
@@ -481,7 +459,6 @@ void VulkanExampleBase::renderLoop()
 		if (viewUpdated)
 		{
 			viewUpdated = false;
-			viewChanged();
 		}
 
 		while (wl_display_prepare_read(display) != 0)
@@ -518,7 +495,6 @@ void VulkanExampleBase::renderLoop()
 		if (viewUpdated)
 		{
 			viewUpdated = false;
-			viewChanged();
 		}
 		xcb_generic_event_t *event;
 		while ((event = xcb_poll_for_event(connection)))
@@ -989,6 +965,9 @@ void VulkanExampleBase::handleMessages(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
 #elif defined(VK_USE_PLATFORM_ANDROID_KHR)
 int32_t VulkanExampleBase::handleAppInput(struct android_app* app, AInputEvent* event)
 {
+    ImGuiIO& io = ImGui::GetIO();
+    bool uiMouseCapture = io.WantCaptureMouse;
+
 	VulkanExampleBase* vulkanExample = reinterpret_cast<VulkanExampleBase*>(app->userData);
 	if (AInputEvent_getType(event) == AINPUT_EVENT_TYPE_MOTION)
 	{
@@ -1006,74 +985,87 @@ int32_t VulkanExampleBase::handleAppInput(struct android_app* app, AInputEvent* 
 
 			case AINPUT_SOURCE_TOUCHSCREEN: {
 				int32_t action = AMotionEvent_getAction(event);
+				int32_t pointerCount = AMotionEvent_getPointerCount(event);
+				int32_t flags = action & AMOTION_EVENT_ACTION_MASK;
 
-				switch (action) {
-					case AMOTION_EVENT_ACTION_UP: {
-						vulkanExample->lastTapTime = AMotionEvent_getEventTime(event);
-						vulkanExample->touchPos.x = AMotionEvent_getX(event, 0);
-						vulkanExample->touchPos.y = AMotionEvent_getY(event, 0);
-						vulkanExample->touchTimer = 0.0;
-						vulkanExample->touchDown = false;
-						vulkanExample->camera.keys.up = false;
-
-						// Detect single tap
-						int64_t eventTime = AMotionEvent_getEventTime(event);
-						int64_t downTime = AMotionEvent_getDownTime(event);
-						if (eventTime - downTime <= vks::android::TAP_TIMEOUT) {
-							float deadZone = (160.f / vks::android::screenDensity) * vks::android::TAP_SLOP * vks::android::TAP_SLOP;
-							float x = AMotionEvent_getX(event, 0) - vulkanExample->touchPos.x;
-							float y = AMotionEvent_getY(event, 0) - vulkanExample->touchPos.y;
-							if ((x * x + y * y) < deadZone) {
-								vulkanExample->mouseButtons.left = true;
-							}
-						};
-
-						return 1;
-						break;
-					}
-					case AMOTION_EVENT_ACTION_DOWN: {
-						// Detect double tap
-						int64_t eventTime = AMotionEvent_getEventTime(event);
-						if (eventTime - vulkanExample->lastTapTime <= vks::android::DOUBLE_TAP_TIMEOUT) {
-							float deadZone = (160.f / vks::android::screenDensity) * vks::android::DOUBLE_TAP_SLOP * vks::android::DOUBLE_TAP_SLOP;
-							float x = AMotionEvent_getX(event, 0) - vulkanExample->touchPos.x;
-							float y = AMotionEvent_getY(event, 0) - vulkanExample->touchPos.y;
-							if ((x * x + y * y) < deadZone) {
-								vulkanExample->keyPressed(TOUCH_DOUBLE_TAP);
-								vulkanExample->touchDown = false;
-							}
-						}
-						else {
-							vulkanExample->touchDown = true;
-						}
-						vulkanExample->touchPos.x = AMotionEvent_getX(event, 0);
-						vulkanExample->touchPos.y = AMotionEvent_getY(event, 0);
-						vulkanExample->mousePos.x = AMotionEvent_getX(event, 0);
-						vulkanExample->mousePos.y = AMotionEvent_getY(event, 0);
-						break;
-					}					
+				switch (flags) {
+					case AMOTION_EVENT_ACTION_DOWN:
+                    case AMOTION_EVENT_ACTION_POINTER_DOWN: {
+                        for (uint32_t i = 0; i < pointerCount; i++) {
+                            vulkanExample->touchPoints[i].x = AMotionEvent_getX(event, i);
+                            vulkanExample->touchPoints[i].y = AMotionEvent_getY(event, i);
+                        };
+                        int32_t pointerIndex = (action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
+                        if (pointerIndex < 2) {
+                            vulkanExample->touchPoints[pointerIndex].down = true;
+                        }
+                        if (pointerCount < 2) {
+                            // Detect single tap
+                            int64_t eventTime = AMotionEvent_getEventTime(event);
+                            int64_t downTime = AMotionEvent_getDownTime(event);
+                            if (eventTime - downTime <= vks::android::TAP_TIMEOUT) {
+                                float deadZone = (160.f / vks::android::screenDensity) * vks::android::TAP_SLOP * vks::android::TAP_SLOP;
+                                float x = AMotionEvent_getX(event, 0) - vulkanExample->touchPoints[0].x;
+                                float y = AMotionEvent_getY(event, 0) - vulkanExample->touchPoints[0].y;
+                                if ((x * x + y * y) < deadZone) {
+                                    vulkanExample->mousePos.x = vulkanExample->touchPoints[0].x;
+                                    vulkanExample->mousePos.y = vulkanExample->touchPoints[0].y;
+                                    vulkanExample->mouseButtons.left = true;
+                                }
+                            };
+                        }
+                        break;
+                    }
+					case AMOTION_EVENT_ACTION_UP:
+                    case AMOTION_EVENT_ACTION_POINTER_UP: {
+                        int32_t pointerIndex = (action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
+                        if (pointerIndex < 2) {
+                            vulkanExample->touchPoints[pointerIndex].down = false;
+                        }
+                        if (pointerCount < 2) {
+                            vulkanExample->touchPoints[1].down = false;
+                        }
+                        break;
+                    }
 					case AMOTION_EVENT_ACTION_MOVE: {
-						bool handled = false;
-						if (!handled) {
-							int32_t eventX = AMotionEvent_getX(event, 0);
-							int32_t eventY = AMotionEvent_getY(event, 0);
+					    // Pinch and zoom
+                        if (!uiMouseCapture && vulkanExample->touchPoints[0].down && vulkanExample->touchPoints[1].down) {
+                            for (uint32_t i = 0; i < pointerCount; i++) {
+                                if (vulkanExample->touchPoints[i].down) {
+                                    vulkanExample->touchPoints[i].x = AMotionEvent_getX(event, i);
+                                    vulkanExample->touchPoints[i].y = AMotionEvent_getY(event, i);
+                                }
+                            };
+                            float dx = vulkanExample->touchPoints[1].x - vulkanExample->touchPoints[0].x;
+                            float dy = vulkanExample->touchPoints[1].y - vulkanExample->touchPoints[0].y;
+                            float d = sqrt(dx * dx + dy * dy);
+                            if (d < vulkanExample->pinchDist) {
+                                vulkanExample->camera.translate(glm::vec3(0.0f, 0.0f, 0.1f));
+                            };
+                            if (d > vulkanExample->pinchDist) {
+                                vulkanExample->camera.translate(glm::vec3(0.0f, 0.0f, -0.1f));
+                            };
+                            vulkanExample->pinchDist = d;
+                        } else {
+                            // Rotate
+                            if (!uiMouseCapture && vulkanExample->touchPoints[0].down) {
+                                int32_t eventX = AMotionEvent_getX(event, 0);
+                                int32_t eventY = AMotionEvent_getY(event, 0);
 
-							float deltaX = (float)(vulkanExample->touchPos.y - eventY) * vulkanExample->camera.rotationSpeed * 0.5f;
-							float deltaY = (float)(vulkanExample->touchPos.x - eventX) * vulkanExample->camera.rotationSpeed * 0.5f;
+                                float deltaX = (vulkanExample->touchPoints[0].y - eventY) * vulkanExample->camera.rotationSpeed * 0.5f;
+                                float deltaY = (vulkanExample->touchPoints[0].x - eventX) * vulkanExample->camera.rotationSpeed * 0.5f;
 
-							vulkanExample->camera.rotate(glm::vec3(deltaX, 0.0f, 0.0f));
-							vulkanExample->camera.rotate(glm::vec3(0.0f, -deltaY, 0.0f));
+                                vulkanExample->camera.rotate(glm::vec3(deltaX, 0.0f, 0.0f));
+                                vulkanExample->camera.rotate(glm::vec3(0.0f, -deltaY, 0.0f));
 
-							vulkanExample->viewChanged();
-
-							vulkanExample->touchPos.x = eventX;
-							vulkanExample->touchPos.y = eventY;
-						}
+                                vulkanExample->touchPoints[0].x = eventX;
+                                vulkanExample->touchPoints[0].y = eventY;
+                            }
+                        }
 						break;
 					}
 					default:
 						return 1;
-						break;
 				}
 			}
 
@@ -1637,7 +1629,7 @@ void VulkanExampleBase::handleEvent(const xcb_generic_event_t *event)
 }
 #endif
 
-void VulkanExampleBase::viewChanged() {}
+void VulkanExampleBase::windowResized() {}
 
 void VulkanExampleBase::keyPressed(uint32_t) {}
 
@@ -1839,7 +1831,7 @@ void VulkanExampleBase::windowResize()
 	vkDeviceWaitIdle(device);
 
 	camera.updateAspectRatio((float)width / (float)height);
-	viewChanged();
+	windowResized();
 
 	prepared = true;
 }
@@ -1849,7 +1841,13 @@ void VulkanExampleBase::handleMouseMove(int32_t x, int32_t y)
 	int32_t dx = (int32_t)mousePos.x - x;
 	int32_t dy = (int32_t)mousePos.y - y;
 
-	bool handled = false;
+	ImGuiIO& io = ImGui::GetIO();
+	bool handled = io.WantCaptureMouse;
+
+	if (handled) {
+		mousePos = glm::vec2((float)x, (float)y);
+		return;
+	}
 
 	if (handled) {
 		mousePos = glm::vec2((float)x, (float)y);
